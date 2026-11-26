@@ -9,9 +9,9 @@
 // triangle pass-through Geometry SPIR-V module (`tools/bary_fallback_gs.py` equivalent) in memory for the exact
 // `(VS, PS)` pair:
 //   - copies `BuiltIn Position` across the triangle's 3 vertices (`Triangles` -> `OutputTriangleStrip`, 3 vertices);
-//   - copies every `vec4<f32>` `Location` input the PS reads (other than `bary_location`) that the VS exports, and
-//     zero-fills any declared PS `Location` input the VS omits without declaring a dangling GS `Input` (preserving
-//     `VUID-RuntimeSpirv-OpEntryPoint-08743` on both `VS -> GS` and `GS -> PS` interfaces);
+//   - copies each used `vec4<f32>` `Location` input other than `bary_location` that the VS exports. The runtime
+//     keeps unused or unexported PS locations as zero-filled GS outputs, and packs the VS -> GS interface
+//     independently of the GS -> PS interface when geometry input locations are scarce;
 //   - forwards a VS `BuiltIn ClipDistance` or `BuiltIn CullDistance` `float[1..8]` array when present (rejecting
 //     mixed clip+cull and `ShaderLayer` / `ShaderViewportIndex`, which a pass-through helper cannot forward);
 //   - writes `(1, 0, 0)`, `(0, 1, 0)`, `(0, 0, 1)` at `bary_location` so perspective interpolation yields
@@ -36,18 +36,77 @@ struct BaryFallbackGsInfo {
     std::uint32_t cull_count = 0;
 };
 
-inline bool build_bary_fallback_gs(std::span<const std::uint32_t> vs_words,
-                                   std::span<const std::uint32_t> ps_words,
-                                   std::uint32_t bary_location,
-                                   std::vector<std::uint32_t>& gs_words,
-                                   BaryFallbackGsInfo* out_info = nullptr,
-                                   std::string* error = nullptr) {
+struct BaryFallbackGsLimits {
+    std::uint32_t input_components = 0;
+    std::uint32_t output_components = 0;
+    std::uint32_t total_output_components = 0;
+};
+
+namespace spirv_detail {
+
+// The varyings are logical pointers to Input variables. Mark their first use, including when a copy, access chain
+// or call passes a pointer onward. Inspect only pointer-capable ID operands: an ExtInst opcode, memory-access
+// mask or similar literal may have the same numeric value as a live or dead variable's ID.
+inline void visit_bary_input_pointer_operands(const Inst& inst, const auto& visit) {
+    const auto at = [&](std::size_t i) {
+        if (i < inst.words.size()) visit(inst.words[i]);
+    };
+    const auto from = [&](std::size_t i) {
+        for (; i < inst.words.size(); ++i) visit(inst.words[i]);
+    };
+    switch (inst.opcode) {
+    case kOpLoad:
+    case kOpAccessChain:
+    case kOpInBoundsAccessChain:
+    case 67:  // OpPtrAccessChain
+    case 70:  // OpInBoundsPtrAccessChain
+    case 83:  // OpCopyObject
+    case 124: // OpBitcast
+    case 400: // OpCopyLogical
+        at(3);
+        break;
+    case kOpStore:
+    case 63:  // OpCopyMemory
+    case 64:  // OpCopyMemorySized
+        at(1);
+        at(2);
+        break;
+    case 57:  // OpFunctionCall
+    case 169: // OpSelect (the condition is not a pointer)
+        from(4);
+        break;
+    case kOpExtInst:
+    case 4433: // OpExtInstWithForwardRefsKHR
+        from(5);  // skip the instruction-set ID and literal opcode
+        break;
+    case 245: // OpPhi
+        for (std::size_t i = 3; i < inst.words.size(); i += 2) at(i);
+        break;
+    case 254: // OpReturnValue
+        at(1);
+        break;
+    case kOpVariable: // initializer of a function-local pointer variable
+        at(4);
+        break;
+    case 401: // OpPtrEqual
+    case 402: // OpPtrNotEqual
+    case 403: // OpPtrDiff
+        at(3);
+        at(4);
+        break;
+    }
+}
+
+inline bool emit_bary_fallback_gs(std::span<const std::uint32_t> vs_words,
+                                 std::span<const std::uint32_t> ps_words, std::uint32_t bary_location,
+                                 std::vector<std::uint32_t>& gs_words, BaryFallbackGsInfo* out_info,
+                                 std::string* error, BaryFallbackGsLimits limits = {},
+                                 std::vector<std::uint32_t>* packed_vs = nullptr) {
     const auto fail = [&](const std::string& msg) {
         if (error) *error = msg;
         return false;
     };
 
-    using namespace spirv_detail;
     constexpr std::uint32_t kSpirvVersion15 = 0x00010500u;
     constexpr std::uint16_t kOpTypeVoid = 19;
     constexpr std::uint16_t kOpTypeArray = 28;
@@ -96,6 +155,8 @@ inline bool build_bary_fallback_gs(std::span<const std::uint32_t> vs_words,
     std::map<std::uint32_t, std::uint32_t> vs_var_builtins;                       // var_id -> BuiltIn
     std::map<std::uint32_t, std::vector<std::pair<std::uint32_t, std::uint32_t>>> vs_member_builtins;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> vs_loc_decs;             // (target_id, loc)
+    std::set<std::uint32_t> vs_component_targets;
+    bool vs_member_locations = false;
 
     for (const Inst& inst : vs_mod.insts) {
         if (inst.opcode == kOpFunction) break;
@@ -109,8 +170,11 @@ inline bool build_bary_fallback_gs(std::span<const std::uint32_t> vs_words,
         } else if (inst.opcode == kOpDecorate && inst.words.size() >= 4) {
             if (inst.words[2] == kDecorationBuiltIn) vs_var_builtins[inst.words[1]] = inst.words[3];
             if (inst.words[2] == kDecorationLocation) vs_loc_decs.emplace_back(inst.words[1], inst.words[3]);
-        } else if (inst.opcode == kOpMemberDecorate && inst.words.size() >= 5 && inst.words[3] == kDecorationBuiltIn) {
-            vs_member_builtins[inst.words[1]].emplace_back(inst.words[2], inst.words[4]);
+            if (inst.words[2] == kDecorationComponent) vs_component_targets.insert(inst.words[1]);
+        } else if (inst.opcode == kOpMemberDecorate && inst.words.size() >= 5) {
+            if (inst.words[3] == kDecorationBuiltIn)
+                vs_member_builtins[inst.words[1]].emplace_back(inst.words[2], inst.words[4]);
+            if (inst.words[3] == kDecorationLocation) vs_member_locations = true;
         } else if (inst.opcode == kOpTypeFloat && inst.words.size() == 3 && inst.words[2] == 32) {
             vs_float32_tys.insert(inst.words[1]);
         } else if (inst.opcode == kOpTypeInt && inst.words.size() == 4 && inst.words[2] == 32) {
@@ -177,11 +241,10 @@ inline bool build_bary_fallback_gs(std::span<const std::uint32_t> vs_words,
     if (clip_count && cull_count)
         return fail("bary_fallback: cannot forward mixed ClipDistance and CullDistance");
 
-    std::map<std::uint32_t, std::uint32_t> vs_out_loc_pointee;  // loc -> pointee_ty
+    std::map<std::uint32_t, std::uint32_t> vs_out_var_by_loc;
     for (const auto& [target, loc] : vs_loc_decs) {
-        const auto it = vs_out_var_pointee.find(target);
-        if (it == vs_out_var_pointee.end()) continue;
-        if (!vs_out_loc_pointee.emplace(loc, it->second).second)
+        if (!vs_out_var_pointee.count(target)) continue;
+        if (!vs_out_var_by_loc.emplace(loc, target).second)
             return fail("bary_fallback: duplicate VS Output Location " + std::to_string(loc));
     }
 
@@ -192,6 +255,7 @@ inline bool build_bary_fallback_gs(std::span<const std::uint32_t> vs_words,
     std::set<std::uint32_t> ps_v4float_tys;
     std::map<std::uint32_t, std::uint32_t> ps_ptr_in_pointee;
     std::map<std::uint32_t, std::uint32_t> ps_in_var_pointee;
+    std::map<std::uint32_t, std::uint32_t> ps_in_var_by_loc;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> ps_loc_decs;
     std::set<std::uint32_t> ps_component_targets;
 
@@ -224,6 +288,22 @@ inline bool build_bary_fallback_gs(std::span<const std::uint32_t> vs_words,
             return fail("bary_fallback: Component-decorated PS Input at Location " + std::to_string(loc));
         if (!ps_in_loc_pointee.emplace(loc, it->second).second)
             return fail("bary_fallback: duplicate PS Input Location " + std::to_string(loc));
+        ps_in_var_by_loc.emplace(loc, target);
+    }
+
+    // The translator also declares inputs it never reads. A variable not referenced in any function is unused,
+    // even if listed in OpEntryPoint.
+    std::set<std::uint32_t> referenced_ps_inputs;
+    if (packed_vs) {
+        bool in_function = false;
+        for (const Inst& inst : ps_mod.insts) {
+            if (inst.opcode == kOpFunction) in_function = true;
+            if (inst.opcode == kOpFunctionEnd) in_function = false;
+            if (!in_function) continue;
+            visit_bary_input_pointer_operands(inst, [&](std::uint32_t id) {
+                if (ps_in_var_pointee.count(id)) referenced_ps_inputs.insert(id);
+            });
+        }
     }
 
     if (const auto bary_it = ps_in_loc_pointee.find(bary_location);
@@ -240,14 +320,67 @@ inline bool build_bary_fallback_gs(std::span<const std::uint32_t> vs_words,
         if (!ps_v4float_tys.count(pt_ty))
             return fail("bary_fallback: PS pass-through Input at Location " + std::to_string(loc) + " is not vec4<f32>");
         pass_locs.push_back(loc);
-        const auto vs_it = vs_out_loc_pointee.find(loc);
-        if (vs_it != vs_out_loc_pointee.end()) {
-            if (!vs_v4float_tys.count(vs_it->second))
+        if (packed_vs && !referenced_ps_inputs.count(ps_in_var_by_loc.at(loc))) {
+            zero_loc_set.insert(loc);
+            continue;
+        }
+        const auto vs_it = vs_out_var_by_loc.find(loc);
+        if (vs_it != vs_out_var_by_loc.end()) {
+            if (!vs_v4float_tys.count(vs_out_var_pointee.at(vs_it->second)) ||
+                vs_component_targets.count(vs_it->second))
                 return fail("bary_fallback: VS Output at Location " + std::to_string(loc) + " is not vec4<f32>");
             forwarded_locs.push_back(loc);
         } else {
             zero_loc_set.insert(loc);
         }
+    }
+
+    const std::uint32_t builtin_components = 4 + clip_count + cull_count;
+    std::map<std::uint32_t, std::uint32_t> remapped_inputs;   // PS location -> new GS input location
+    std::map<std::uint32_t, std::uint32_t> vs_location_edits; // VS variable ID -> new output location
+    if (limits.input_components) {
+        const std::uint64_t required = builtin_components + 4ull * forwarded_locs.size();
+        if (required > limits.input_components)
+            return fail("bary_fallback: GS needs " + std::to_string(required) + " input components, device permits " +
+                        std::to_string(limits.input_components));
+        const std::uint32_t slots = (limits.input_components - builtin_components) / 4;
+        std::set<std::uint32_t> used(forwarded_locs.begin(), forwarded_locs.end());
+        std::uint32_t next_free = 0;
+        for (const std::uint32_t loc : forwarded_locs) {
+            if (loc < slots) continue;
+            // A free low slot may still contain an unread VS output. Swap it into the moved output's old slot,
+            // so the VS neither adds a location nor needs to rewrite any stores or pointer types.
+            while (used.count(next_free)) ++next_free;
+            const auto other = vs_out_var_by_loc.find(next_free);
+            if (other != vs_out_var_by_loc.end()) {
+                if (!vs_v4float_tys.count(vs_out_var_pointee.at(other->second)) ||
+                    vs_component_targets.count(other->second))
+                    return fail("bary_fallback: cannot repack a non-vec4 VS Output at Location " +
+                                std::to_string(next_free));
+                vs_location_edits.emplace(other->second, loc);
+            }
+            remapped_inputs.emplace(loc, next_free);
+            vs_location_edits.emplace(vs_out_var_by_loc.at(loc), next_free++);
+        }
+        if (!vs_location_edits.empty()) {
+            if (vs_member_locations)
+                return fail("bary_fallback: cannot repack VS outputs with member Locations");
+            for (const auto& [loc, var] : vs_out_var_by_loc) {
+                if (!vs_v4float_tys.count(vs_out_var_pointee.at(var)) || vs_component_targets.count(var))
+                    return fail("bary_fallback: cannot repack a non-vec4 VS Output at Location " + std::to_string(loc));
+            }
+        }
+    }
+    if (limits.output_components || limits.total_output_components) {
+        const std::uint64_t count = builtin_components + 3 + 4ull * pass_locs.size();
+        const std::uint64_t last = std::max(4ull * bary_location + 3,
+                                            pass_locs.empty() ? 0ull : 4ull * pass_locs.back() + 4);
+        if (const auto required = std::max(count, last); limits.output_components && required > limits.output_components)
+            return fail("bary_fallback: GS needs " + std::to_string(required) + " output components per vertex, "
+                        "device permits " + std::to_string(limits.output_components));
+        if (limits.total_output_components && 3 * count > limits.total_output_components)
+            return fail("bary_fallback: GS needs " + std::to_string(3 * count) + " total output components, "
+                        "device permits " + std::to_string(limits.total_output_components));
     }
 
     // --- Synthesize Geometry SPIR-V module ---
@@ -336,8 +469,11 @@ inline bool build_bary_fallback_gs(std::span<const std::uint32_t> vs_words,
         gs.insts.push_back(make_inst(kOpDecorate, {id_in_dist, kDecorationBuiltIn, dist_builtin}));
         gs.insts.push_back(make_inst(kOpDecorate, {id_out_dist, kDecorationBuiltIn, dist_builtin}));
     }
-    for (std::uint32_t loc : forwarded_locs)
-        gs.insts.push_back(make_inst(kOpDecorate, {id_in_loc[loc], kDecorationLocation, loc}));
+    for (std::uint32_t loc : forwarded_locs) {
+        const auto packed = remapped_inputs.find(loc);
+        gs.insts.push_back(make_inst(kOpDecorate, {id_in_loc[loc], kDecorationLocation,
+                                                  packed == remapped_inputs.end() ? loc : packed->second}));
+    }
     for (std::uint32_t loc : pass_locs)
         gs.insts.push_back(make_inst(kOpDecorate, {id_out_loc[loc], kDecorationLocation, loc}));
     gs.insts.push_back(make_inst(kOpDecorate, {id_out_bary, kDecorationLocation, bary_location}));
@@ -420,8 +556,56 @@ inline bool build_bary_fallback_gs(std::span<const std::uint32_t> vs_words,
     gs.insts.push_back(make_inst(kOpFunctionEnd, {}));
 
     gs.header = {kSpirvMagic, kSpirvVersion15, 0u, next_id, 0u};
+    if (!vs_location_edits.empty()) {
+        for (Inst& inst : vs_mod.insts) {
+            if (inst.opcode != kOpDecorate || inst.words.size() != 4 || inst.words[2] != kDecorationLocation) continue;
+            const auto it = vs_location_edits.find(inst.words[1]);
+            if (it != vs_location_edits.end()) inst.words[3] = it->second;
+        }
+        *packed_vs = vs_mod.serialize();
+    }
     gs_words = gs.serialize();
     if (out_info) *out_info = {clip_count, cull_count};
+    return true;
+}
+
+}  // namespace spirv_detail
+
+inline bool build_bary_fallback_gs(std::span<const std::uint32_t> vs_words,
+                                   std::span<const std::uint32_t> ps_words, std::uint32_t bary_location,
+                                   std::vector<std::uint32_t>& gs_words, BaryFallbackGsInfo* out_info = nullptr,
+                                   std::string* error = nullptr) {
+    return spirv_detail::emit_bary_fallback_gs(vs_words, ps_words, bary_location, gs_words, out_info, error);
+}
+
+// Link the two interfaces separately. FP16 synthesis needs the ordinary varying namespace; only the VS outputs
+// actually read by the GS need to land within its smaller input limit. The final GS -> PS locations stay put.
+inline bool link_bary_fallback_stages(std::vector<std::uint32_t>& vs_words, const ShaderEntry& vs_entry,
+                                     std::vector<std::uint32_t>& ps_words, const ShaderEntry& ps_entry,
+                                     std::uint32_t f16_top_location, BaryFallbackGsLimits limits,
+                                     std::vector<std::uint32_t>& gs_words, BaryFallbackGsInfo* info = nullptr,
+                                     std::string* error = nullptr) {
+    if (!ps_entry.bary_fallback_location) {
+        if (error) *error = "bary_fallback: missing pixel shader input location";
+        return false;
+    }
+    const bool link_halves = !vs_entry.f16_halves.empty() || !ps_entry.f16_halves.empty();
+    std::vector<std::uint32_t> linked_vs, linked_ps;
+    if (link_halves) {
+        linked_vs = vs_words;
+        linked_ps = ps_words;
+        if (limits.output_components)
+            f16_top_location = std::min(f16_top_location,
+                                        f16_half_top_location(limits.output_components, limits.output_components));
+        if (!link_f16_halves(linked_vs, vs_entry, linked_ps, ps_entry, error, f16_top_location)) return false;
+    }
+    std::vector<std::uint32_t> packed_vs;
+    if (!spirv_detail::emit_bary_fallback_gs(link_halves ? linked_vs : vs_words, link_halves ? linked_ps : ps_words,
+                                            *ps_entry.bary_fallback_location, gs_words, info, error, limits, &packed_vs))
+        return false;
+    if (!packed_vs.empty()) vs_words = std::move(packed_vs);
+    else if (link_halves) vs_words = std::move(linked_vs);
+    if (link_halves) ps_words = std::move(linked_ps);
     return true;
 }
 
