@@ -14,6 +14,7 @@
 
 <p align="center">
   <a href="docs/i18n/README.md">Other languages</a> |
+  <a href="#fork-contributions-robot00f">Fork contributions</a> |
   <a href="#project-status">Status</a> |
   <a href="#how-to-build">How to build</a> |
   <a href="#how-it-works">How it works</a> |
@@ -43,6 +44,26 @@ happens **on your PC, from your own copy of the game**.
 Discord: https://discord.gg/ETf4qj5acN
 
 Telegram: https://t.me/mandyport
+
+<br>
+
+## Fork contributions (`@robot00f`)
+
+Active development fork contributing upstream to [**ProjectLeonida/mandy**](https://github.com/ProjectLeonida/mandy), focused on **low-spec / older PC hardware compatibility** (validated natively on **Intel Core i7-2600** Sandy Bridge AVX1/SSE4.2 + **NVIDIA GeForce GTX 1050 Ti 4 GB** Pascal + **16 GB DDR3 RAM** on Windows 10), **Wave64-on-Wave32 shader optimization**, and **D3D12-to-Vulkan runtime stability**:
+
+| Area | Contribution | Upstream PR |
+|---|---|---|
+| **Pre-Haswell CPU (AVX1 / SSE4.2)** | Ahead-of-time AVX1/SSE4.2 native JIT stub compiler and in-place VEX rewriter (`isa_jit_patch`) | [#2414](https://github.com/ProjectLeonida/mandy/pull/2414) |
+| **Pre-Haswell CPU (AVX1 / SSE4.2)** | `F16C`, `FMA3` (all 60 forms) and 256-bit `AVX2` emulation via `XSTATE_AVX` | [#2191](https://github.com/ProjectLeonida/mandy/pull/2191) |
+| **Pre-Haswell CPU (AVX1 / SSE4.2)** | `BMI1`, `BMI2`, `MOVBE` `#UD` emulation and AOT `LZCNT`/`TZCNT` patching | [#2190](https://github.com/ProjectLeonida/mandy/pull/2190) |
+| **Pre-Haswell CPU (AVX1 / SSE4.2)** | Baseline instruction census and pre-Haswell AVX1/SSE4.2 delta analysis | [#2188](https://github.com/ProjectLeonida/mandy/pull/2188) |
+| **Pascal / Pre-Turing GPU (4 GB VRAM)** | Drop acceleration-structure postbuild queries when `LEONIDA_RT_AS=off` | [#2413](https://github.com/ProjectLeonida/mandy/pull/2413) |
+| **Pascal / Pre-Turing GPU (4 GB VRAM)** | Synthesize `--bary-fallback` geometry shader stage in graphics PSOs & `vk_pipeline_check`, plus auto-detection without `VK_KHR_fragment_shader_barycentric` | [#1497](https://github.com/ProjectLeonida/mandy/pull/1497), [#1890](https://github.com/ProjectLeonida/mandy/pull/1890), [#2192](https://github.com/ProjectLeonida/mandy/pull/2192) |
+| **Pascal / Pre-Turing GPU (4 GB VRAM)** | Auto-enable `--mesh-compute` without `VK_EXT_mesh_shader` and validate compute PSOs in `vk_pipeline_check` | [#1885](https://github.com/ProjectLeonida/mandy/pull/1885), [#1514](https://github.com/ProjectLeonida/mandy/pull/1514) |
+| **Shader Translator (Wave64 → Wave32)** | Coalesce and inline Wave64 `x_round` exchanges, vote caching, deferred `%scc` votes and `v_readfirstlane_b32` batching | [#2119](https://github.com/ProjectLeonida/mandy/pull/2119) |
+| **Xbox D3D12 → Vulkan Runtime** | Preserve `HEAP_DIRECTLY_INDEXED` root-signature flags on hosts refusing serialization (**Merged**) | [#1353](https://github.com/ProjectLeonida/mandy/pull/1353) |
+| **Xbox D3D12 → Vulkan Runtime** | Sub-page 256B UBO alignment fallback, `GCL9` `DYNAMIC_*` PSO state, 64 KiB console heap alignment, and shadow guard reopening on dropped geometry tiles | [#1458](https://github.com/ProjectLeonida/mandy/pull/1458), [#1377](https://github.com/ProjectLeonida/mandy/pull/1377), [#1328](https://github.com/ProjectLeonida/mandy/pull/1328), [#2471](https://github.com/ProjectLeonida/mandy/pull/2471) |
+| **ABI Measurements, CI & Tooling** | Nested outer-repo + UTF-8 CI registration scan, retail D3D12/audio ABI call-site measurements, Wine/Pascal `ctest` matrix, and history manifest | [#2472](https://github.com/ProjectLeonida/mandy/pull/2472), [#2070](https://github.com/ProjectLeonida/mandy/pull/2070), [#1143](https://github.com/ProjectLeonida/mandy/pull/1143), [#1125](https://github.com/ProjectLeonida/mandy/pull/1125), [#1167](https://github.com/ProjectLeonida/mandy/pull/1167), [#1219](https://github.com/ProjectLeonida/mandy/pull/1219), [#1217](https://github.com/ProjectLeonida/mandy/pull/1217), [#1207](https://github.com/ProjectLeonida/mandy/pull/1207), [#1340](https://github.com/ProjectLeonida/mandy/pull/1340) |
 
 <br>
 
